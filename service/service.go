@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gorilla/mux"
 	"github.com/nfnt/resize"
 )
 
@@ -21,7 +20,6 @@ import (
 type Resizer struct {
 	BaseURL string
 	MaxSize image.Point
-	Mux     *mux.Router
 }
 
 // New returns an initialised `*Resizer`.
