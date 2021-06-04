@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"image"
 	"image/gif"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/honeycombio/beeline-go"
 	"github.com/nfnt/resize"
 )
 
@@ -32,7 +34,7 @@ func (rs *Resizer) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	pathComponents := strings.Split(r.URL.Path[1:], "/")
 	exactFit := false
 	if len(pathComponents) == 1 {
-		mimetype, content, err := fetchImageBytes(rs.BaseURL + pathComponents[0])
+		mimetype, content, err := fetchImageBytes(r.Context(), rs.BaseURL + pathComponents[0])
 		if err != nil {
 			http.NotFound(rw, r)
 			return
@@ -92,7 +94,7 @@ func (rs *Resizer) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		key = pathComponents[0]
 	}
 
-	mimetype, resized, err := rs.resizeToFit(key, maxSize, exactFit)
+	mimetype, resized, err := rs.resizeToFit(r.Context(), key, maxSize, exactFit)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
@@ -107,8 +109,15 @@ func addHeaders(h http.Header, mimetype string, content []byte) {
 	h.Add("Content-Length", strconv.Itoa(len(content)))
 }
 
-func fetchImageBytes(url string) (string, []byte, error) {
-	r, err := http.Get(url)
+func fetchImageBytes(ctx context.Context, url string) (string, []byte, error) {
+	ctx, span := beeline.StartSpan(ctx, "fetch_image_bytes")
+	defer span.Send()
+	span.AddField("url", url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	r, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", nil, err
 	}
@@ -119,8 +128,10 @@ func fetchImageBytes(url string) (string, []byte, error) {
 	return r.Header.Get("Content-Type"), b, err
 }
 
-func (rs *Resizer) resizeToFit(key string, size image.Point, exact bool) (string, []byte, error) {
-	mimetype, b, err := fetchImageBytes(rs.BaseURL + key)
+func (rs *Resizer) resizeToFit(ctx context.Context, key string, size image.Point, exact bool) (string, []byte, error) {
+	ctx, span := beeline.StartSpan(ctx, "resize_to_fit")
+	defer span.Send()
+	mimetype, b, err := fetchImageBytes(ctx, rs.BaseURL + key)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to fetch image: %w", err)
 	}
@@ -138,17 +149,25 @@ func (rs *Resizer) resizeToFit(key string, size image.Point, exact bool) (string
 			return "", nil, fmt.Errorf("wrong gif size: expected %dx%d but got %dx%d", imgSize.X, imgSize.Y, size.X, size.Y)
 		}
 	}
+	_, decodeSpan := beeline.StartSpan(ctx, "image_decode")
 	img, imgFormat, err := image.Decode(bytes.NewBuffer(b))
+	decodeSpan.AddField("image_format", imgFormat)
+	decodeSpan.Send()
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to decode image: %w", err)
 	}
 	if img.Bounds().Dx() == size.X && img.Bounds().Dy() == size.Y {
 		return mimetype, b, nil
 	}
+	_, resizeSpan := beeline.StartSpan(ctx, "image_resize")
 	resized := resize.Resize(uint(size.X), uint(size.Y), img, resize.Lanczos2)
+	resizeSpan.Send()
 	buf := bytes.NewBuffer([]byte{})
+	_, encodeSpan := beeline.StartSpan(ctx, "image_encode")
+	defer encodeSpan.Send()
 	switch imgFormat {
 	case "jpeg":
+		encodeSpan.AddField("image_format", "jpeg")
 		if err := jpeg.Encode(buf, resized, &jpeg.Options{Quality: 80}); err != nil {
 			return "", nil, fmt.Errorf("failed to encode jpeg: %w", err)
 		}
@@ -157,6 +176,7 @@ func (rs *Resizer) resizeToFit(key string, size image.Point, exact bool) (string
 		log.Printf("Unknown image type %q, default to png output", imgFormat)
 		fallthrough
 	case "png":
+		encodeSpan.AddField("image_format", "png")
 		if err := png.Encode(buf, resized); err != nil {
 			return "", nil, fmt.Errorf("failed to encode png: %w", err)
 		}
