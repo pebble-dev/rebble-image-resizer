@@ -34,7 +34,7 @@ func (rs *Resizer) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	pathComponents := strings.Split(r.URL.Path[1:], "/")
 	exactFit := false
 	if len(pathComponents) == 1 {
-		mimetype, content, err := fetchImageBytes(r.Context(), rs.BaseURL + pathComponents[0])
+		mimetype, content, err := fetchImageBytes(r.Context(), rs.BaseURL+pathComponents[0])
 		if err != nil {
 			http.NotFound(rw, r)
 			return
@@ -94,7 +94,9 @@ func (rs *Resizer) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		key = pathComponents[0]
 	}
 
-	mimetype, resized, err := rs.resizeToFit(r.Context(), key, maxSize, exactFit)
+	q := r.URL.Query()
+	freezeAnim := q.Get("freeze") == "true"
+	mimetype, resized, err := rs.resizeToFit(r.Context(), key, maxSize, exactFit, freezeAnim)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
@@ -128,10 +130,10 @@ func fetchImageBytes(ctx context.Context, url string) (string, []byte, error) {
 	return r.Header.Get("Content-Type"), b, err
 }
 
-func (rs *Resizer) resizeToFit(ctx context.Context, key string, size image.Point, exact bool) (string, []byte, error) {
+func (rs *Resizer) resizeToFit(ctx context.Context, key string, size image.Point, exact, freezeAnim bool) (string, []byte, error) {
 	ctx, span := beeline.StartSpan(ctx, "resize_to_fit")
 	defer span.Send()
-	mimetype, b, err := fetchImageBytes(ctx, rs.BaseURL + key)
+	mimetype, b, err := fetchImageBytes(ctx, rs.BaseURL+key)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to fetch image: %w", err)
 	}
@@ -144,6 +146,13 @@ func (rs *Resizer) resizeToFit(ctx context.Context, key string, size image.Point
 		}
 		imgSize := img.Bounds().Max
 		if imgSize.Eq(size) {
+			if freezeAnim {
+				buf := bytes.NewBuffer([]byte{})
+				if err := png.Encode(buf, img); err != nil {
+					return "", nil, fmt.Errorf("failed to encode gif as png: %w", err)
+				}
+				return "image/png", buf.Bytes(), nil
+			}
 			return "image/gif", b, nil
 		} else {
 			return "", nil, fmt.Errorf("wrong gif size: expected %dx%d but got %dx%d", imgSize.X, imgSize.Y, size.X, size.Y)
